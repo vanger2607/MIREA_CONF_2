@@ -1,84 +1,117 @@
 import argparse
-import os
-import re
 import sys
+from pathlib import Path
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-ALLOWED_TEST_MODES = {"none", "local", "mock"}
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-def is_url(s: str) -> bool:
-    try:
-        p = urlparse(s)
-        return p.scheme in ("http", "https")
-    except Exception:
-        return False
 
-def validate_args(args):
-    errors = []
+class ConfigModel(BaseModel):
+    # package: обязательно, формат groupId:artifactId — проверяется через pattern
+    package: Annotated[
+        str,
+        Field(
+            ...,
+            description="Maven coordinate groupId:artifactId",
+            pattern=r'^[^:]+:[^:]+$',
+        ),
+    ]
 
-    if not args.package or not args.package.strip():
-        errors.append("package: Package name is required.")
-    else:
-        if not re.match(r"^[A-Za-z0-9_.-]+$", args.package):
-            errors.append("package: Invalid package name (allowed: letters, digits, '_', '-', '.').")
+    # repo: строка, но дополнительная логика проверки ниже (url или path)
+    repo: Annotated[str, Field(..., description="Base URL of Maven repo or path to test repo")]
 
-    if args.repo:
-        if is_url(args.repo):
-            pass
-        else:
-            # treat as path
-            if not os.path.exists(args.repo):
-                errors.append(f"repo: Path not found: {args.repo}")
+    # version: не пустая строка, по умолчанию "latest"
+    version: Annotated[str, Field("latest", min_length=1, description="Version to fetch, or 'latest'")]
 
-    if args.test_mode not in ALLOWED_TEST_MODES:
-        errors.append(f"test_mode: Unknown mode '{args.test_mode}'. Allowed: {', '.join(ALLOWED_TEST_MODES)}")
+    # repo_mode: ограниченный набор значений: auto, url, file
+    repo_mode: Annotated[Literal["auto", "url", "file"], Field("auto", description="Mode for repo: 'auto'|'url'|'file'")]
 
-    if args.version:
-        if not re.match(r"^[0-9A-Za-z_.+-:]+$", args.version):
-            errors.append("version: Unusual version format. Use semantic-ish format like '1.2.3' or a tag.")
+    # ascii_tree: булевый флаг
+    ascii_tree: Annotated[bool, Field(False, description="If true, print dependencies as ASCII tree")]
 
-    return errors
+    # проверка допустимости repo_mode
+    @field_validator("repo_mode")
+    def repo_mode_allowed(cls, v: str) -> str:
+        allowed = {"auto", "url", "file"}
+        if v not in allowed:
+            raise ValueError(f"repo_mode must be one of {sorted(allowed)}")
+        return v
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="DepVis Stage 1 — minimal CLI prototype")
-    parser.add_argument("-p", "--package", required=True, help="Name of analyzed package (e.g. express)")
-    parser.add_argument("-r", "--repo", default="", help="Repository URL or path to test repo")
-    parser.add_argument("--test-mode", default="none", help="Test repo mode: none|local|mock")
-    parser.add_argument("-v", "--version", default="", help="Package version (optional)")
-    parser.add_argument("--ascii-tree", action="store_true", help="Print dependencies as ASCII tree")
+    # проверка repo с учётом выбранного repo_mode
+    # mode="after" позволяет получить остальные поля через info.data
+    @field_validator("repo", mode="after")
+    def repo_must_be_valid_for_mode(cls, v: str, info) -> str:
+        mode = info.data.get("repo_mode", "auto")
+        parsed = urlparse(v)
 
-    args = parser.parse_args(argv)
+        def looks_like_url() -> bool:
+            return bool(parsed.scheme in ("http", "https") and parsed.netloc)
 
-    errors = validate_args(args)
-    if errors:
-        for e in errors:
-            print("Error:", e, file=sys.stderr)
-        sys.exit(2)
+        def looks_like_path() -> bool:
+            try:
+                return Path(v).exists()
+            except Exception:
+                return False
 
-    # Requirement 3: print all user-configurable parameters as key=value
-    params = {
-        "package": args.package,
-        "repo": args.repo,
-        "test_mode": args.test_mode,
-        "version": args.version if args.version else "latest",
-        "ascii_tree": str(args.ascii_tree),
-    }
+        if mode == "url":
+            if not looks_like_url():
+                raise ValueError(f"repo must be a valid http(s) URL in repo_mode='url'; got '{v}'")
+        elif mode == "file":
+            if not looks_like_path():
+                raise ValueError(f"repo must be an existing file/directory path in repo_mode='file'; got '{v}'")
+        else:  # auto
+            if not (looks_like_url() or looks_like_path()):
+                raise ValueError(
+                    "repo must be either a valid http(s) URL or an existing file/directory path (repo_mode='auto')"
+                )
+        return v
 
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(prog="dep", description="packages.")
+    parser.add_argument("--package", "-p", type=str, required=True,
+                        help="Package coordinate: groupId:artifactId (e.g. com.google.guava:guava)")
+    parser.add_argument("--repo", "-r", type=str, required=True,
+                        help="Base URL of Maven repo (e.g. https://repo1.maven.org/maven2) or path to test repo")
+    parser.add_argument("--version", "-v", type=str, default="latest",
+                        help="Version to fetch (or 'latest')")
+    parser.add_argument("--repo-mode", "-m", type=str, choices=["auto", "url", "file"], default="auto",
+                        help="Mode to interpret --repo: 'auto' (try URL then path), 'url' (force URL), 'file' (force path)")
+    parser.add_argument("--ascii-tree", action="store_true",
+                        help="Output dependencies in ASCII-tree format (boolean flag)")
+    return parser.parse_args(argv)
+
+
+def print_config(params: dict):
     for k, v in params.items():
         print(f"{k}={v}")
 
-    if args.test_mode == "mock":
-        print("# running in mock mode: using embedded test data")
-    elif args.repo:
-        print(f"# would scan repository: {args.repo}")
-    else:
-        print("# no repo provided")
 
-    
-    if args.ascii_tree:
-        print("\n# ASCII dependency tree (placeholder)")
-        print(f"{args.package}@{params['version']}")
-        print("└─ dependencies not implemented")
+def main(argv=None):
+    args = parse_args(argv)
+
+    params = {
+        "package": args.package,
+        "repo": args.repo,
+        "repo_mode": args.repo_mode,
+        "version": args.version,
+        "ascii_tree": args.ascii_tree,
+    }
+
+
+    print_config(params)
+
+    try:
+        cfg = ConfigModel(**params)
+    except ValidationError as e:
+        print("Validation error:", file=sys.stderr)
+        print(e, file=sys.stderr)
+        raise SystemExit(2)
+
+    print("\nConfiguration validated successfully. Ready to proceed.")
+    return cfg
+
 
 if __name__ == "__main__":
     main()
